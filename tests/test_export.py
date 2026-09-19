@@ -118,7 +118,7 @@ class RunTest(unittest.TestCase):
         self.out_dir = Path(tmp.name) / "nested" / "export"
         mock.patch.object(exporter.time, "sleep").start()
         mock.patch.dict(exporter.os.environ, {"FNS_TOKEN": "fake-token-123"}).start()
-        self.urlopen = mock.patch.object(exporter.urllib.request, "urlopen").start()
+        self.urlopen = mock.patch.object(exporter._opener, "open").start()
         self.addCleanup(mock.patch.stopall)
 
     def run_main(self, argv):

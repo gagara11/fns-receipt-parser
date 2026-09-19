@@ -23,3 +23,12 @@ fns-receipts*/
 .DS_Store
 .idea/
 .vscode/
+
+# MCP runtime and local infrastructure credentials
+.private/
+state/
+secrets/
+*.sqlite3*
+*.pem
+*.key
+*.bundle

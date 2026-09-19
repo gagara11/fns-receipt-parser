@@ -1,0 +1,13 @@
+.git
+.venv
+.private
+state
+secrets
+__pycache__
+**/__pycache__
+*.sqlite3*
+*.json
+*.csv
+*.env
+.env
+*.bundle

@@ -1,0 +1,44 @@
+name: fns-receipts
+services:
+  fns-receipts-mcp:
+    image: ${FNS_IMAGE:?An immutable tested image is required}
+    container_name: fns-receipts-mcp
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 100
+    mem_limit: 512m
+    cpus: 1
+    stop_grace_period: 120s
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+    volumes:
+      - /opt/fns-receipts-mcp/data:/data
+      - /opt/fns-receipts-mcp/secrets:/secrets
+    ports:
+      - "127.0.0.1:9140:8000"
+    dns: [1.1.1.1, 9.9.9.9]
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+    networks:
+      mcp_home:
+        gw_priority: 1000
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+networks:
+  mcp_home:
+    external: true
+    name: mcp_home

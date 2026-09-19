@@ -23,6 +23,17 @@ DETAIL_URL = f"{BASE}/v1/receipt/fiscal_data"
 PAGE_SIZE = 10          # exact page size observed in the web app
 REQUEST_DELAY = 0.08    # gentle delay between API calls
 TIMEOUT = 30
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never forward a receipt-session bearer token to a redirect target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(NoRedirect, urllib.request.ProxyHandler({}))
 
 MAX_ATTEMPTS = 3        # 1 request + up to 2 retries
 BACKOFF_BASE = 1.0      # seconds between attempts: 1, 2
@@ -257,7 +268,7 @@ def service_error_text(body):
 
 def http_error_to_api_error(e, token):
     try:
-        body = e.read().decode("utf-8", errors="replace")
+        body = e.read(MAX_RESPONSE_BYTES + 1).decode("utf-8", errors="replace")
     except Exception:
         body = ""
     base = HTTP_STATUS_MESSAGES.get(e.code, f"Ошибка HTTP {e.code}.")
@@ -290,8 +301,10 @@ def request_json_once(url, token, payload):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            raw = resp.read()
+        with _opener.open(req, timeout=TIMEOUT) as resp:
+            raw = resp.read(MAX_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raise ApiError("Ответ сервиса превышает допустимый размер.")
     except urllib.error.HTTPError as e:
         raise http_error_to_api_error(e, token) from None
     except urllib.error.URLError as e:
@@ -489,7 +502,11 @@ def write_csv(path, fieldnames, rows):
     with path.open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames, delimiter=";")
         w.writeheader()
-        w.writerows(rows)
+        # Spreadsheet applications interpret these prefixes as formulas.
+        for row in rows:
+            w.writerow({key: ("'" + value if isinstance(value, str)
+                              and value.lstrip().startswith(("=", "+", "-", "@"))
+                              else value) for key, value in row.items()})
 
 
 def write_summary_csv(path, enriched):

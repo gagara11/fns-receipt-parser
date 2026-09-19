@@ -16,8 +16,8 @@ class FakeResponse:
     def __init__(self, body):
         self._body = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
 
-    def read(self):
-        return self._body
+    def read(self, size=-1):
+        return self._body if size < 0 else self._body[:size]
 
     def __enter__(self):
         return self
@@ -38,7 +38,7 @@ class ApiTestCase(unittest.TestCase):
     """Patches the network and sleeping; no test talks to the real service."""
 
     def setUp(self):
-        self.urlopen = mock.patch.object(exporter.urllib.request, "urlopen").start()
+        self.urlopen = mock.patch.object(exporter._opener, "open").start()
         self.sleep = mock.patch.object(exporter.time, "sleep").start()
         self.addCleanup(mock.patch.stopall)
         for stream in (redirect_stdout, redirect_stderr):

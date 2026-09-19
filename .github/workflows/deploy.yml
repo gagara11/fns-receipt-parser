@@ -1,0 +1,50 @@
+name: CI and deploy
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    name: Security and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Validate deployment scripts
+        run: bash -n deploy/*.sh
+      - name: Build locked image
+        run: docker build -t fns-receipts:ci .
+      - name: Unit and MCP integration tests
+        run: docker run --rm --network none -v "$PWD/tests:/app/tests:ro" fns-receipts:ci python -m unittest discover -v
+      - name: Audit runtime dependencies
+        run: |
+          docker run --rm --user root fns-receipts:ci sh -c 'pip install -q pip-audit==2.10.1 && pip-audit --strict --disable-pip -r requirements.txt'
+  deploy:
+    name: Deploy to VPS
+    needs: test
+    if: github.repository == 'gagara11/fns-receipt-parser' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    concurrency:
+      group: fns-receipts-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Deploy the tested commit using the restricted SSH key
+        env:
+          DEPLOY_KEY: ${{ secrets.FNS_DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_KEY"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/fns-deploy
+          chmod 600 ~/.ssh/fns-deploy
+          install -m 600 deploy/known_hosts ~/.ssh/known_hosts
+          ssh -i ~/.ssh/fns-deploy -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 fns-receipts-deploy@78.17.34.198 "deploy $GITHUB_SHA"
