@@ -20,7 +20,15 @@ def rpc(method, params):
     assert "error" not in result
     return result["result"]
 assert rpc("initialize", {"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"deployment-check","version":"1"}})["serverInfo"]["name"] == "fns-receipts"
-assert len(rpc("tools/list", {})["tools"]) == 5
+assert {t['name'] for t in rpc("tools/list", {})["tools"]} == {
+    'sync_status','sync_history','sync_events','sync_now','list_receipts','get_receipt','spending_summary'}
 status = rpc("tools/call", {"name":"sync_status","arguments":{}})["structuredContent"]
 assert status["interval_seconds"] == 14400
+assert status['scheduler_alive'] and not status['persistence_error']
+assert isinstance(rpc('tools/call', {'name':'sync_history','arguments':{'limit':1}})['structuredContent']['runs'], list)
+assert isinstance(rpc('tools/call', {'name':'sync_events','arguments':{'limit':1}})['structuredContent']['events'], list)
+req = urllib.request.Request(base+'/metrics', headers={'Authorization':'Bearer '+token})
+metrics = urllib.request.urlopen(req, timeout=10).read().decode()
+assert 'fns_scheduler_alive 1' in metrics
+assert token not in metrics
 print("MCP smoke OK; sync state:", status.get("last_error") or "ready")

@@ -8,10 +8,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import export_nalog_receipts as upstream
+from fns_mcp.redaction import clean_text, receipt_ref
 
 
 class SyncError(Exception):
     """A safe, fixed error code, suitable for status and logs."""
+
+    def __init__(self, code, *, context=None, retryable=False):
+        super().__init__(code)
+        self.context = context or {}
+        self.retryable = retryable
 
 
 def atomic_json(path: Path, data: dict):
@@ -34,6 +40,21 @@ class FNSClient:
         self.delay = delay
         self.last_request = 0.0
         self.session = None
+        self.observe = lambda event, **fields: None
+
+    @staticmethod
+    def auth_error(error):
+        return error.status == 401 or (error.status in (403, 422)
+                                      and error.service_code == "authentication.failed")
+
+    def error_context(self, error, path, payload, attempt):
+        secrets = list((self.session or {}).values()) + [payload.get("key")]
+        return {"operation": {"/v1/receipt": "receipt_list", "/v1/receipt/fiscal_data": "receipt_detail",
+                              "/v1/auth/token": "token_refresh"}[path],
+                "http_status": error.status, "fns_code": clean_text(error.service_code, secrets, 96),
+                "message": clean_text(error.service_message, secrets), "error_type": error.kind,
+                "attempt": attempt, "receipt_ref": receipt_ref(payload.get("key")),
+                "offset": payload.get("offset")}
 
     def load(self):
         try:
@@ -55,12 +76,32 @@ class FNSClient:
         for attempt in range(3):
             time.sleep(max(0, self.delay - (time.monotonic() - self.last_request)))
             self.last_request = time.monotonic()
+            operation = {"/v1/receipt": "receipt_list", "/v1/receipt/fiscal_data": "receipt_detail",
+                         "/v1/auth/token": "token_refresh"}[path]
+            info = {"operation": operation, "attempt": attempt + 1,
+                    "receipt_ref": receipt_ref(payload.get("key")), "offset": payload.get("offset")}
+            self.observe("request_started", **info)
+            started = time.monotonic()
             try:
-                return upstream.request_json_once(upstream.BASE + path, token, payload)
+                data = upstream.request_json_once(upstream.BASE + path, token, payload)
             except upstream.ApiError as error:
-                if not error.retryable or attempt == 2:
+                context = self.error_context(error, path, payload, attempt + 1)
+                context["duration_ms"] = round((time.monotonic()-started)*1000, 2)
+                error.context = context
+                self.observe("request_failed", **context)
+                # 422 is overloaded by FNS. Retry unknown rejections, not authentication.
+                retryable = error.retryable or (error.status == 422 and not self.auth_error(error)
+                                                and path != "/v1/auth/token")
+                error.retryable = retryable
+                if not retryable or attempt == 2:
                     raise
-                time.sleep(min(30, max(2 ** attempt, error.retry_after or 0)))
+                delay = min(30, max(2 ** attempt, error.retry_after or 0))
+                self.observe("request_retry", **info, retry_in_seconds=delay)
+                time.sleep(delay)
+            else:
+                self.observe("request_succeeded", **info, http_status=200,
+                             duration_ms=round((time.monotonic()-started)*1000, 2))
+                return data
 
     def _refresh(self):
         refresh = self.session.get("refreshToken")
@@ -75,9 +116,10 @@ class FNSClient:
                                    "userAgent": self.session.get("userAgent", "Mozilla/5.0")}},
             })
         except upstream.ApiError as error:
-            if error.status in (400, 401, 403):
-                raise SyncError("authentication_required") from None
-            raise SyncError("refresh_temporarily_failed") from None
+            context = getattr(error, "context", {})
+            if error.status in (400, 401, 403) or self.auth_error(error):
+                raise SyncError("authentication_required", context=context) from None
+            raise SyncError("refresh_temporarily_failed", context=context, retryable=True) from None
         if not isinstance(data, dict) or not isinstance(data.get("token"), str) or not data["token"]:
             raise SyncError("invalid_refresh_response")
         for field in ("token", "refreshToken", "tokenExpireIn", "refreshTokenExpiresIn"):
@@ -85,6 +127,7 @@ class FNSClient:
                 self.session[field] = data[field]
         # Rotated refresh tokens survive container recreation and VPS restart.
         atomic_json(self.session_file, self.session)
+        self.observe("token_refreshed", operation="token_refresh")
 
     def _token(self):
         if self.session is None:
@@ -109,13 +152,13 @@ class FNSClient:
                     raise SyncError("invalid_fns_response")
                 return data
             except upstream.ApiError as error:
-                if error.status == 401 and attempt == 0:
+                if self.auth_error(error) and attempt == 0:
                     self._refresh()
                     continue
-                code = {401: "authentication_required", 403: "access_denied",
-                        422: "account_action_required", 429: "rate_limited"}.get(
-                            error.status, "fns_unavailable")
-                raise SyncError(code) from None
+                code = "authentication_required" if self.auth_error(error) else {
+                    403: "access_denied", 422: "fns_rejected_request", 429: "rate_limited"}.get(
+                        error.status, "fns_unavailable")
+                raise SyncError(code, context=getattr(error, "context", {}), retryable=error.retryable) from None
 
     def receipts(self):
         seen = set()
@@ -125,6 +168,7 @@ class FNSClient:
             page = data.get("receipts")
             if not isinstance(page, list):
                 raise SyncError("invalid_receipts_page")
+            self.observe("page_received", operation="receipt_list", offset=offset, page_size=len(page))
             new = 0
             for receipt in page:
                 if not isinstance(receipt, dict) or not isinstance(receipt.get("key"), str):

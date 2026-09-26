@@ -37,7 +37,7 @@ class MCPTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["result"]["serverInfo"]["name"], "fns-receipts")
         tools = self.call("tools/list").json()["result"]["tools"]
-        self.assertEqual({t["name"] for t in tools}, {"sync_status", "list_receipts", "get_receipt", "spending_summary", "sync_now"})
+        self.assertEqual({t["name"] for t in tools}, {"sync_status", "list_receipts", "get_receipt", "spending_summary", "sync_now", "sync_history", "sync_events"})
 
     def test_real_tool_call(self):
         response = self.call("tools/call", {"name": "sync_status", "arguments": {}}).json()
@@ -52,6 +52,22 @@ class MCPTest(unittest.TestCase):
         response = self.client.post("/mcp", headers={**self.headers, "Content-Type": "application/json"},
                                     content=b"x"*65537)
         self.assertEqual(response.status_code, 413)
+
+    def test_diagnostics_tools_return_bounded_history(self):
+        for name, field in [('sync_history', 'runs'), ('sync_events', 'events')]:
+            response = self.call('tools/call', {'name':name, 'arguments':{'limit':5}}).json()['result']
+            self.assertFalse(response.get('isError', False), response)
+            self.assertEqual(response['structuredContent'][field], [])
+
+    def test_metrics_require_auth_and_do_not_expose_identifiers(self):
+        self.assertEqual(self.client.get('/metrics').status_code, 401)
+        response = self.client.get('/metrics', headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('fns_receipts 0', response.text)
+        self.assertIn('fns_sync_running 0', response.text)
+        self.assertIn('fns_sync_stale 1', response.text)
+        self.assertNotIn('x'*48, response.text)
+        self.assertNotIn('seller', response.text)
 
 
 class SchedulerLifetimeTest(unittest.TestCase):

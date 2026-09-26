@@ -123,11 +123,15 @@ ITEM_FIELDS = [
 class ApiError(Exception):
     """API request failed. The message never contains the token."""
 
-    def __init__(self, message, status=None, retryable=False, retry_after=None):
+    def __init__(self, message, status=None, retryable=False, retry_after=None,
+                 service_code=None, service_message=None, kind="http"):
         super().__init__(message)
         self.status = status
         self.retryable = retryable
         self.retry_after = retry_after
+        self.service_code = service_code
+        self.service_message = service_message
+        self.kind = kind
 
 
 # ---------------------------------------------------------------- CLI / input
@@ -275,6 +279,14 @@ def http_error_to_api_error(e, token):
     details = service_error_text(body) if body else ""
     message = f"{base} Ответ сервиса: {details}" if details else base
     retry_after = None
+    service_code = service_message = None
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict):
+            service_code = parsed.get("code") if isinstance(parsed.get("code"), str) else None
+            service_message = parsed.get("message") if isinstance(parsed.get("message"), str) else None
+    except ValueError:
+        pass
     if e.code == 429 and e.headers is not None:
         retry_after = parse_retry_after(e.headers.get("Retry-After"))
     return ApiError(
@@ -282,6 +294,8 @@ def http_error_to_api_error(e, token):
         status=e.code,
         retryable=e.code in RETRYABLE_STATUSES,
         retry_after=retry_after,
+        service_code=redact(service_code, token) if service_code else None,
+        service_message=redact(service_message, token) if service_message else None,
     )
 
 
@@ -304,24 +318,24 @@ def request_json_once(url, token, payload):
         with _opener.open(req, timeout=TIMEOUT) as resp:
             raw = resp.read(MAX_RESPONSE_BYTES + 1)
             if len(raw) > MAX_RESPONSE_BYTES:
-                raise ApiError("Ответ сервиса превышает допустимый размер.")
+                raise ApiError("Ответ сервиса превышает допустимый размер.", kind="response_too_large")
     except urllib.error.HTTPError as e:
         raise http_error_to_api_error(e, token) from None
     except urllib.error.URLError as e:
         raise ApiError(
             redact(f"Сетевая ошибка (нет соединения, DNS или таймаут): {e.reason}", token),
-            retryable=True) from None
+            retryable=True, kind="network") from None
     except (OSError, http.client.HTTPException) as e:
         # Timeouts and broken connections while reading the body are not
         # wrapped in URLError.
         raise ApiError(
             redact(f"Сетевая ошибка или таймаут: {e}", token),
-            retryable=True) from None
+            retryable=True, kind="network") from None
 
     try:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
-        raise ApiError("Сервис вернул некорректный JSON.") from None
+        raise ApiError("Сервис вернул некорректный JSON.", kind="invalid_json") from None
 
 
 def request_json(url, token, payload, max_attempts=MAX_ATTEMPTS):
