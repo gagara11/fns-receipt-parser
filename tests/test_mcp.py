@@ -1,9 +1,11 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 from starlette.testclient import TestClient
 from fns_mcp.server import create_app
+from fns_mcp.store import Store
 
 
 class MCPTest(unittest.TestCase):
@@ -50,3 +52,41 @@ class MCPTest(unittest.TestCase):
         response = self.client.post("/mcp", headers={**self.headers, "Content-Type": "application/json"},
                                     content=b"x"*65537)
         self.assertEqual(response.status_code, 413)
+
+
+class SchedulerLifetimeTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name)
+        (self.path / "mcp_token").write_text("x" * 48)
+        self.store = Store(self.path / "receipts.sqlite3")
+        self.headers = {"Authorization": "Bearer " + "x" * 48,
+                        "Accept": "application/json, text/event-stream"}
+
+    def wait_for_attempt(self, after=0):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            status = self.store.status()
+            if status.get("last_attempt_at", 0) > after and not status.get("running"):
+                return status
+            time.sleep(.01)
+        self.fail("Background sync did not execute independently of the MCP request lifetime")
+
+    def test_due_sync_runs_without_any_mcp_client(self):
+        self.store.state(next_sync_at=time.time() + .05)
+        with TestClient(create_app(self.path, self.path), base_url="http://localhost:8000"):
+            status = self.wait_for_attempt()
+            self.assertEqual(status["last_error"], "authentication_required")
+            self.assertAlmostEqual(status["next_sync_at"] - status["last_attempt_at"], 14400)
+
+    def test_manual_sync_still_runs_after_stateless_request_closes(self):
+        with TestClient(create_app(self.path, self.path), base_url="http://localhost:8000") as client:
+            client.post("/mcp", headers=self.headers, json={"jsonrpc": "2.0", "id": 1,
+                        "method": "initialize", "params": {"protocolVersion": "2025-06-18",
+                        "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}})
+            first = self.wait_for_attempt()["last_attempt_at"]
+            response = client.post("/mcp", headers=self.headers, json={"jsonrpc": "2.0", "id": 2,
+                        "method": "tools/call", "params": {"name": "sync_now", "arguments": {}}})
+            self.assertTrue(response.json()["result"]["structuredContent"]["accepted"])
+            self.assertEqual(self.wait_for_attempt(first)["last_error"], "authentication_required")
