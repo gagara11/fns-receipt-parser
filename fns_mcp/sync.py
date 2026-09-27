@@ -113,7 +113,8 @@ class SyncService:
                     self.journal.event(self.run_id, 'receipt_failed', 'error',
                                        **{**error_context, 'receipt_ref':receipt_ref(receipt['key']), 'reason':str(error)})
                     self.progress('collecting')
-                    if str(error) in ("authentication_required", "access_denied", "rate_limited", "refresh_temporarily_failed"):
+                    if str(error) in ("authentication_required", "access_denied", "rate_limited",
+                                      "refresh_temporarily_failed", "refresh_rejected", "invalid_refresh_response"):
                         raise
                     if consecutive_failures >= 5:
                         raise SyncError('consecutive_failures', context=error_context)

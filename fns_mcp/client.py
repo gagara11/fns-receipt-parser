@@ -1,6 +1,9 @@
 """FNS session handling. No credentials or upstream error bodies are logged."""
 
+import base64
+import binascii
 import json
+import math
 import os
 import tempfile
 import time
@@ -34,6 +37,25 @@ def atomic_json(path: Path, data: dict):
             os.unlink(name)
 
 
+def access_token_expiry(session):
+    """Expiry is a scheduling hint only; FNS, not decoded JWT claims, authorizes requests."""
+    expiries = []
+    try:
+        dt = datetime.fromisoformat(session['tokenExpireIn'].replace('Z', '+00:00'))
+        expiries.append(dt.replace(tzinfo=timezone.utc).timestamp() if dt.tzinfo is None else dt.timestamp())
+    except (KeyError, ValueError, TypeError, AttributeError, OverflowError, OSError):
+        pass
+    try:
+        payload = session['token'].split('.')[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+        expiry = claims.get('exp')
+        if type(expiry) in (int, float) and math.isfinite(expiry):
+            expiries.append(expiry)
+    except (KeyError, IndexError, ValueError, TypeError, AttributeError, OverflowError, binascii.Error):
+        pass
+    return min(expiries) if expiries else None
+
+
 class FNSClient:
     def __init__(self, session_file: Path, delay: float = 3.2):
         self.session_file = session_file
@@ -45,7 +67,8 @@ class FNSClient:
     @staticmethod
     def auth_error(error):
         return error.status == 401 or (error.status in (403, 422)
-                                      and error.service_code == "authentication.failed")
+                                      and error.service_code in ("Not Authenticated", "authentication.failed",
+                                                                 "authentication.failed.expired.token"))
 
     def error_context(self, error, path, payload, attempt):
         secrets = list((self.session or {}).values()) + [payload.get("key")]
@@ -119,41 +142,41 @@ class FNSClient:
             context = getattr(error, "context", {})
             if error.status in (400, 401, 403) or self.auth_error(error):
                 raise SyncError("authentication_required", context=context) from None
-            raise SyncError("refresh_temporarily_failed", context=context, retryable=True) from None
+            if error.retryable:
+                raise SyncError("refresh_temporarily_failed", context=context, retryable=True) from None
+            raise SyncError("refresh_rejected", context=context) from None
         if not isinstance(data, dict) or not isinstance(data.get("token"), str) or not data["token"]:
             raise SyncError("invalid_refresh_response")
+        updated = dict(self.session)
+        # An expiry belongs to its token, not to the next token after rotation.
+        updated.pop('tokenExpireIn', None)
+        if data.get('refreshToken'):
+            updated.pop('refreshTokenExpiresIn', None)
         for field in ("token", "refreshToken", "tokenExpireIn", "refreshTokenExpiresIn"):
             if data.get(field):
-                self.session[field] = data[field]
+                updated[field] = data[field]
         # Rotated refresh tokens survive container recreation and VPS restart.
-        atomic_json(self.session_file, self.session)
+        atomic_json(self.session_file, updated)
+        self.session = updated
         self.observe("token_refreshed", operation="token_refresh")
 
-    def _token(self):
+    def request(self, path, payload):
         if self.session is None:
             self.load()
-        expiry = self.session.get("tokenExpireIn")
-        expired = not self.session.get("token")
-        if expiry:
-            try:
-                dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
-                expired |= dt.astimezone(timezone.utc).timestamp() <= time.time() + 300
-            except (ValueError, TypeError, AttributeError):
-                expired = True
-        if expired:
+        expiry = access_token_expiry(self.session)
+        refreshed = not self.session.get('token') or (expiry is not None and expiry <= time.time() + 300)
+        if refreshed:
             self._refresh()
-        return self.session["token"]
-
-    def request(self, path, payload):
         for attempt in range(2):
             try:
-                data = self._post(path, self._token(), payload)
+                data = self._post(path, self.session['token'], payload)
                 if not isinstance(data, dict):
                     raise SyncError("invalid_fns_response")
                 return data
             except upstream.ApiError as error:
-                if self.auth_error(error) and attempt == 0:
+                if self.auth_error(error) and not refreshed:
                     self._refresh()
+                    refreshed = True
                     continue
                 code = "authentication_required" if self.auth_error(error) else {
                     403: "access_denied", 422: "fns_rejected_request", 429: "rate_limited"}.get(

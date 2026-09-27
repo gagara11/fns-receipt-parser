@@ -306,7 +306,6 @@ def request_json_once(url, token, payload):
         data=data,
         method="POST",
         headers={
-            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json;charset=UTF-8",
             "Accept": "application/json",
             "Origin": "https://lkdr.nalog.ru",
@@ -314,6 +313,8 @@ def request_json_once(url, token, payload):
             "User-Agent": "Mozilla/5.0",
         },
     )
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
     try:
         with _opener.open(req, timeout=TIMEOUT) as resp:
             raw = resp.read(MAX_RESPONSE_BYTES + 1)
