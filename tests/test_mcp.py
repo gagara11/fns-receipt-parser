@@ -37,12 +37,21 @@ class MCPTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["result"]["serverInfo"]["name"], "fns-receipts")
         tools = self.call("tools/list").json()["result"]["tools"]
-        self.assertEqual({t["name"] for t in tools}, {"sync_status", "list_receipts", "get_receipt", "spending_summary", "sync_now", "sync_history", "sync_events"})
+        self.assertEqual({t["name"] for t in tools}, {"sync_status", "list_receipts", "get_receipt", "receipt_changes", "spending_summary", "sync_now", "sync_history", "sync_events"})
 
     def test_real_tool_call(self):
         response = self.call("tools/call", {"name": "sync_status", "arguments": {}}).json()
         self.assertEqual(response["result"]["structuredContent"]["interval_seconds"], 14400)
         self.assertNotIn("x"*48, str(response))
+
+    def test_receipt_changes_tool_exposes_archive_window(self):
+        Store(Path(self.tmp.name) / "receipts.sqlite3").put(
+            {"key": "test", "totalSum": 1200}, {"totalSum": 1200, "operationType": 1})
+        response = self.call("tools/call", {"name": "receipt_changes", "arguments": {"limit": 10}}).json()
+        result = response["result"]["structuredContent"]
+        self.assertEqual(result["schema_version"], 1)
+        self.assertEqual(result["until_seq"], 1)
+        self.assertEqual(result["receipts"][0]["receipt"]["totalSum"], "1200")
 
     def test_host_and_browser_origin_are_rejected(self):
         self.assertEqual(self.call("tools/list", headers={**self.headers, "Host": "evil.invalid"}).status_code, 421)

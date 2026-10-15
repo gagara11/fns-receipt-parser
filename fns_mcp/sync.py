@@ -95,11 +95,13 @@ class SyncService:
                 self.progress('collecting')
                 if self.stop.is_set():
                     raise SyncError("interrupted")
+                # Refresh list-side data even for detailed receipts. This records source
+                # revisions without re-fetching details, and put preserves old errors.
+                self.store.put(receipt, None)
                 if self.store.has_detail(receipt["key"]):
                     self.counts['skipped'] += 1
                     self.progress('collecting')
                     continue
-                self.store.put(receipt, None)
                 try:
                     detail = client.detail(receipt["key"])
                     self.store.put(receipt, detail)
