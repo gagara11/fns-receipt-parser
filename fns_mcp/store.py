@@ -1,11 +1,37 @@
 """Persistent raw archive. All user filters are bound SQL parameters."""
 
+import hashlib
 import json
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+
+_SAFE_SEQ = 9007199254740991
+_MONEY_FIELDS = {"totalSum", "cashTotalSum", "ecashTotalSum", "prepaidSum", "price", "sum", "ndsSum"}
+_ID_FIELDS = {"fiscalSign", "fiscalDocumentNumber", "fiscalDriveNumber"}
+
+
+def _canonical(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _wire(value, key=None):
+    if isinstance(value, dict):
+        return {name: _wire(item, name) for name, item in value.items()}
+    if isinstance(value, list):
+        return [_wire(item) for item in value]
+    if key in _MONEY_FIELDS and isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+        number = Decimal(str(value))
+        if not number.is_finite():
+            raise ValueError("Invalid monetary value in archive")
+        return format(number, "f")
+    if key in _ID_FIELDS and value is not None:
+        return str(value)
+    return value
 
 
 def dates(date_from, date_to):
@@ -29,7 +55,22 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS receipts_date ON receipts(purchased_at);
                 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS archive_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(receipts)")}
+            if "seq" not in columns:
+                db.execute("ALTER TABLE receipts ADD COLUMN seq INTEGER")
+            db.execute("INSERT OR IGNORE INTO archive_meta VALUES ('archive_id',?)", (str(uuid.uuid4()),))
+            rows = db.execute("SELECT key FROM receipts WHERE seq IS NULL ORDER BY key").fetchall()
+            next_seq = db.execute("SELECT COALESCE(MAX(seq),0) FROM receipts").fetchone()[0]
+            for row in rows:
+                next_seq += 1
+                if next_seq > _SAFE_SEQ:
+                    raise ValueError("Archive revision limit exceeded")
+                db.execute("UPDATE receipts SET seq=? WHERE key=?", (next_seq, row["key"]))
+            db.execute("CREATE INDEX IF NOT EXISTS receipts_seq ON receipts(seq)")
+            db.execute("INSERT INTO archive_meta VALUES ('next_seq',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       (str(next_seq),))
 
     @contextmanager
     def connect(self):
@@ -60,13 +101,58 @@ class Store:
     def put(self, receipt, detail, error=None):
         d = detail or {}
         with self.connect() as db:
-            db.execute("""INSERT INTO receipts VALUES (?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET
-                raw=excluded.raw, detail=COALESCE(excluded.detail,receipts.detail),
-                purchased_at=CASE WHEN excluded.detail IS NOT NULL THEN excluded.purchased_at ELSE receipts.purchased_at END,
-                seller=CASE WHEN excluded.detail IS NOT NULL THEN excluded.seller ELSE receipts.seller END,
-                error=excluded.error""", (receipt["key"], d.get("dateTime") or receipt.get("createdDate"),
-                    d.get("user") or receipt.get("kktOwner", ""), json.dumps(receipt, ensure_ascii=False),
-                    json.dumps(detail, ensure_ascii=False) if detail is not None else None, error))
+            db.execute("BEGIN IMMEDIATE")
+            old = db.execute("SELECT purchased_at,seller,raw,detail,error,seq FROM receipts WHERE key=?",
+                             (receipt["key"],)).fetchone()
+            raw = json.dumps(receipt, ensure_ascii=False)
+            raw_detail = json.dumps(detail, ensure_ascii=False) if detail is not None else (old["detail"] if old else None)
+            new_error = error if error is not None else (None if detail is not None else (old["error"] if old else None))
+            purchased_at = (d.get("dateTime") or receipt.get("createdDate")) if detail is not None else (
+                old["purchased_at"] if old else receipt.get("createdDate"))
+            seller = (d.get("user") or receipt.get("kktOwner", "")) if detail is not None else (
+                old["seller"] if old else receipt.get("kktOwner", ""))
+            changed = old is None or (raw, raw_detail, new_error) != (old["raw"], old["detail"], old["error"])
+            if changed:
+                seq = int(db.execute("SELECT value FROM archive_meta WHERE key='next_seq'").fetchone()[0]) + 1
+                if seq > _SAFE_SEQ:
+                    raise ValueError("Archive revision limit exceeded")
+                db.execute("INSERT INTO archive_meta VALUES ('next_seq',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                           (str(seq),))
+            else:
+                seq = old["seq"]
+            db.execute("""INSERT INTO receipts (key,purchased_at,seller,raw,detail,error,seq) VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(key) DO UPDATE SET purchased_at=excluded.purchased_at,seller=excluded.seller,
+                raw=excluded.raw,detail=excluded.detail,error=excluded.error,seq=excluded.seq""",
+                       (receipt["key"], purchased_at, seller, raw, raw_detail, new_error, seq))
+
+    def changes(self, after_seq=0, until_seq=None, limit=100):
+        if (isinstance(after_seq, bool) or not isinstance(after_seq, int) or not 0 <= after_seq <= _SAFE_SEQ
+                or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100
+                or (until_seq is not None and (isinstance(until_seq, bool) or not isinstance(until_seq, int)
+                                                or not 0 <= until_seq <= _SAFE_SEQ))):
+            raise ValueError("Invalid receipt changes window")
+        with self.connect() as db:
+            archive_id = db.execute("SELECT value FROM archive_meta WHERE key='archive_id'").fetchone()[0]
+            current = int(db.execute("SELECT value FROM archive_meta WHERE key='next_seq'").fetchone()[0])
+            window_end = current if until_seq is None else until_seq
+            if window_end > current:
+                raise ValueError("until_seq must not exceed the current archive revision")
+            if after_seq > window_end:
+                raise ValueError("after_seq must not exceed until_seq")
+            rows = db.execute("""SELECT seq,key,raw,detail,error FROM receipts
+                WHERE seq>? AND seq<=? ORDER BY seq LIMIT ?""", (after_seq, window_end, limit + 1)).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        receipts = []
+        for row in rows:
+            receipt = _wire(json.loads(row["raw"]))
+            fiscal_data = _wire(json.loads(row["detail"])) if row["detail"] else None
+            content_hash = hashlib.sha256(_canonical({"receipt": receipt, "fiscal_data": fiscal_data}).encode("utf-8")).hexdigest()
+            receipts.append({"seq": row["seq"], "key": row["key"], "content_hash": content_hash,
+                            "receipt": receipt, "fiscal_data": fiscal_data, "error": row["error"]})
+        next_after_seq = rows[-1]["seq"] if has_more and rows else window_end
+        return {"schema_version": 1, "archive_id": archive_id, "until_seq": window_end,
+                "next_after_seq": next_after_seq, "has_more": has_more, "receipts": receipts}
 
     def get(self, key):
         with self.connect() as db:

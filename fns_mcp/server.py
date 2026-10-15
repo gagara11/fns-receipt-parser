@@ -108,6 +108,11 @@ def create_app(data_dir=None, secret_dir=None, *, scheduler=True):
         return store.get(key)
 
     @mcp.tool(annotations=readonly)
+    def receipt_changes(after_seq: int = 0, until_seq: int | None = None, limit: int = 100) -> dict[str, Any]:
+        """Read revisioned archive updates in a fixed keyset window. Decimal money fields are strings."""
+        return store.changes(after_seq, until_seq, limit)
+
+    @mcp.tool(annotations=readonly)
     def spending_summary(amount_divisor: Literal[1, 100], date_from: str | None = None,
                          date_to: str | None = None) -> dict[str, Any]:
         """Summarize paid amounts minus returns by seller. First verify fiscal data units against a real
