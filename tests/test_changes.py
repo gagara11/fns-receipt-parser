@@ -64,6 +64,25 @@ class ReceiptChangesTest(unittest.TestCase):
         self.assertEqual(item["fiscal_data"]["items"][0]["quantity"], 1)
         self.assertEqual(item["fiscal_data"]["operationType"], 1)
 
+    def test_wire_keeps_decimal_lexemes_and_stringifies_all_amount_fields(self):
+        self.store.put(self.receipt("precise"), self.detail())
+        raw = ('{"key":"precise","totalSum":0.123456789012345678901234567890,'
+               '"creditSum":11.2300,"provisionSum":2.50,"fiscalDocumentNumber":12345678901234567890}')
+        detail = ('{"totalSum":0.123456789012345678901234567890,"creditSum":11.2300,'
+                  '"provisionSum":2.50,"operationType":1,"items":[{"price":0.123456789012345678901234567890,'
+                  '"quantity":1.25,"sum":0.123456789012345678901234567890}]}')
+        with self.store.connect() as db:
+            db.execute("UPDATE receipts SET raw=?,detail=? WHERE key='precise'", (raw, detail))
+
+        item = self.store.changes()["receipts"][0]
+        exact = "0.123456789012345678901234567890"
+        self.assertEqual(item["receipt"]["totalSum"], exact)
+        self.assertEqual(item["receipt"]["creditSum"], "11.2300")
+        self.assertEqual(item["receipt"]["provisionSum"], "2.50")
+        self.assertEqual(item["fiscal_data"]["totalSum"], exact)
+        self.assertEqual(item["fiscal_data"]["items"][0]["price"], exact)
+        self.assertEqual(item["fiscal_data"]["items"][0]["quantity"], 1.25)
+
     def test_error_retries_do_not_create_transient_or_duplicate_revisions(self):
         receipt = self.receipt()
         self.store.put(receipt, None)

@@ -11,7 +11,8 @@ from pathlib import Path
 
 
 _SAFE_SEQ = 9007199254740991
-_MONEY_FIELDS = {"totalSum", "cashTotalSum", "ecashTotalSum", "prepaidSum", "price", "sum", "ndsSum"}
+_MONEY_FIELDS = {"totalSum", "cashTotalSum", "ecashTotalSum", "prepaidSum", "creditSum",
+                 "provisionSum", "price", "sum", "ndsSum"}
 _ID_FIELDS = {"fiscalSign", "fiscalDocumentNumber", "fiscalDriveNumber"}
 
 
@@ -24,7 +25,13 @@ def _wire(value, key=None):
         return {name: _wire(item, name) for name, item in value.items()}
     if isinstance(value, list):
         return [_wire(item) for item in value]
-    if key in _MONEY_FIELDS and isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError("Invalid decimal value in archive")
+        if key in _MONEY_FIELDS:
+            return format(value, "f")
+        return int(value) if value == value.to_integral_value() else float(value)
+    if key in _MONEY_FIELDS and isinstance(value, (int, float)) and not isinstance(value, bool):
         number = Decimal(str(value))
         if not number.is_finite():
             raise ValueError("Invalid monetary value in archive")
@@ -145,8 +152,8 @@ class Store:
         rows = rows[:limit]
         receipts = []
         for row in rows:
-            receipt = _wire(json.loads(row["raw"]))
-            fiscal_data = _wire(json.loads(row["detail"])) if row["detail"] else None
+            receipt = _wire(json.loads(row["raw"], parse_float=Decimal))
+            fiscal_data = _wire(json.loads(row["detail"], parse_float=Decimal)) if row["detail"] else None
             content_hash = hashlib.sha256(_canonical({"receipt": receipt, "fiscal_data": fiscal_data}).encode("utf-8")).hexdigest()
             receipts.append({"seq": row["seq"], "key": row["key"], "content_hash": content_hash,
                             "receipt": receipt, "fiscal_data": fiscal_data, "error": row["error"]})
