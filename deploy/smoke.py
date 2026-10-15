@@ -21,7 +21,11 @@ def rpc(method, params):
     return result["result"]
 assert rpc("initialize", {"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"deployment-check","version":"1"}})["serverInfo"]["name"] == "fns-receipts"
 assert {t['name'] for t in rpc("tools/list", {})["tools"]} == {
-    'sync_status','sync_history','sync_events','sync_now','list_receipts','get_receipt','spending_summary'}
+    'sync_status','sync_history','sync_events','sync_now','list_receipts','get_receipt','spending_summary','receipt_changes'}
+changes = rpc('tools/call', {'name':'receipt_changes','arguments':{'after_seq':0,'limit':1}})['structuredContent']
+assert changes['schema_version'] == 1 and isinstance(changes['archive_id'], str)
+assert 0 <= changes['next_after_seq'] <= changes['until_seq']
+assert isinstance(changes['receipts'], list) and len(changes['receipts']) <= 1
 status = rpc("tools/call", {"name":"sync_status","arguments":{}})["structuredContent"]
 assert status["interval_seconds"] == 14400
 assert status['scheduler_alive'] and not status['persistence_error']
