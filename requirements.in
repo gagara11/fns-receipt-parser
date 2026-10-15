@@ -1,3 +1,4 @@
+PyJWT==2.15.0
 # Maintained v1 SDK line, explicitly bounded to avoid implicit v2 migration.
 mcp==1.28.1
 uvicorn==0.41.0
